@@ -21,6 +21,7 @@ ALLOWED_FACT_CATEGORIES = frozenset(
     }
 )
 ACKNOWLEDGEMENT = "boleh diingat"
+DELETION_ACKNOWLEDGEMENT = "hapus ingatan saya"
 NOTICE_TTL_MS = 24 * 60 * 60 * 1000
 
 
@@ -84,10 +85,21 @@ class TenantPolicyStore:
                 policy_version TEXT,
                 consented_at_ms INTEGER CHECK (consented_at_ms >= 0),
                 notice_pending_at_ms INTEGER CHECK (notice_pending_at_ms >= 0),
+                deletion_pending_at_ms INTEGER CHECK (deletion_pending_at_ms >= 0),
+                deleting_at_ms INTEGER CHECK (deleting_at_ms >= 0),
                 last_activity_ms INTEGER NOT NULL CHECK (last_activity_ms >= 0)
             )
             """
         )
+        columns = {
+            row[1]
+            for row in self.connection.execute("PRAGMA table_info(tenant_policy)")
+        }
+        for name in ("deletion_pending_at_ms", "deleting_at_ms"):
+            if name not in columns:
+                self.connection.execute(
+                    f"ALTER TABLE tenant_policy ADD COLUMN {name} INTEGER"
+                )
         self.connection.commit()
         self._secure_files()
 
@@ -142,6 +154,35 @@ class TenantPolicyStore:
             self.connection.commit()
             self._secure_files()
 
+    def mark_deletion_notice(self, sender_id: str, *, now_ms: int) -> None:
+        key = self._key(sender_id)
+        with self._lock:
+            row = self.connection.execute(
+                """
+                SELECT policy_version, consented_at_ms, deleting_at_ms
+                FROM tenant_policy
+                WHERE tenant_key = ?
+                """,
+                (key,),
+            ).fetchone()
+            if (
+                row is None
+                or row[0] != self._policy_version
+                or row[1] is None
+                or row[2] is not None
+            ):
+                raise ConsentRequired("current memory policy consent is required")
+            self.connection.execute(
+                """
+                UPDATE tenant_policy
+                SET deletion_pending_at_ms = ?, last_activity_ms = ?
+                WHERE tenant_key = ?
+                """,
+                (now_ms, now_ms, key),
+            )
+            self.connection.commit()
+            self._secure_files()
+
     def accept_acknowledgement(
         self,
         sender_id: str,
@@ -185,7 +226,7 @@ class TenantPolicyStore:
         with self._lock:
             row = self.connection.execute(
                 """
-                SELECT policy_version, consented_at_ms
+                SELECT policy_version, consented_at_ms, deleting_at_ms
                 FROM tenant_policy
                 WHERE tenant_key = ?
                 """,
@@ -195,6 +236,7 @@ class TenantPolicyStore:
                 row is None
                 or row[0] != self._policy_version
                 or row[1] is None
+                or row[2] is not None
             ):
                 raise ConsentRequired("current memory policy consent is required")
             self.connection.execute(
@@ -228,6 +270,65 @@ class TenantPolicyStore:
             self.connection.commit()
             self._secure_files()
 
+    def delete_on_acknowledgement(
+        self,
+        sender_id: str,
+        message: str,
+        *,
+        now_ms: int,
+        delete_workspace: Callable[[str], None],
+    ) -> bool:
+        if message.strip().casefold() != DELETION_ACKNOWLEDGEMENT:
+            return False
+        key = self._key(sender_id)
+        with self._lock:
+            row = self.connection.execute(
+                """
+                SELECT deletion_pending_at_ms
+                FROM tenant_policy
+                WHERE tenant_key = ? AND consented_at_ms IS NOT NULL
+                  AND deleting_at_ms IS NULL
+                """,
+                (key,),
+            ).fetchone()
+            if (
+                row is None
+                or row[0] is None
+                or now_ms - row[0] > NOTICE_TTL_MS
+            ):
+                return False
+            updated = self.connection.execute(
+                """
+                UPDATE tenant_policy
+                SET deleting_at_ms = ?
+                WHERE tenant_key = ? AND deleting_at_ms IS NULL
+                """,
+                (now_ms, key),
+            ).rowcount
+            self.connection.commit()
+            self._secure_files()
+        if updated != 1:
+            return False
+        try:
+            delete_workspace(key)
+        except Exception:
+            with self._lock:
+                self.connection.execute(
+                    "UPDATE tenant_policy SET deleting_at_ms = NULL WHERE tenant_key = ?",
+                    (key,),
+                )
+                self.connection.commit()
+                self._secure_files()
+            raise
+        with self._lock:
+            self.connection.execute(
+                "DELETE FROM tenant_policy WHERE tenant_key = ?",
+                (key,),
+            )
+            self.connection.commit()
+            self._secure_files()
+        return True
+
     def prune_inactive(
         self,
         *,
@@ -251,7 +352,35 @@ class TenantPolicyStore:
             ]
         deleted: list[str] = []
         for key in keys:
-            delete_workspace(key)
+            with self._lock:
+                claimed = self.connection.execute(
+                    """
+                    UPDATE tenant_policy
+                    SET deleting_at_ms = ?
+                    WHERE tenant_key = ? AND deleting_at_ms IS NULL
+                      AND consented_at_ms IS NOT NULL
+                      AND last_activity_ms < ?
+                    """,
+                    (now_ms, key, cutoff),
+                ).rowcount
+                self.connection.commit()
+                self._secure_files()
+            if claimed != 1:
+                continue
+            try:
+                delete_workspace(key)
+            except Exception:
+                with self._lock:
+                    self.connection.execute(
+                        """
+                        UPDATE tenant_policy SET deleting_at_ms = NULL
+                        WHERE tenant_key = ?
+                        """,
+                        (key,),
+                    )
+                    self.connection.commit()
+                    self._secure_files()
+                raise
             with self._lock:
                 self.connection.execute(
                     "DELETE FROM tenant_policy WHERE tenant_key = ?",

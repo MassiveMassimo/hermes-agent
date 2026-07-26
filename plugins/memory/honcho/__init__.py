@@ -259,9 +259,26 @@ PRIVACY_SCHEMA = {
     },
 }
 
+TENANT_CONCLUDE_SCHEMA = {
+    "name": "honcho_conclude",
+    "description": (
+        "List the current user's explicitly approved CV-memory facts. "
+        "Facts can be added only from a verified user command beginning with "
+        "'/ingat '; the model cannot create, alter, or delete them."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "list": {"type": "boolean", "const": True},
+            "query": {"type": "string"},
+        },
+        "required": ["list"],
+    },
+}
+
 
 ALL_TOOL_SCHEMAS = [PROFILE_SCHEMA, SEARCH_SCHEMA, REASONING_SCHEMA, CONTEXT_SCHEMA, CONCLUDE_SCHEMA]
-TENANT_TOOL_SCHEMAS = [PRIVACY_SCHEMA, PROFILE_SCHEMA, CONCLUDE_SCHEMA]
+TENANT_TOOL_SCHEMAS = [PRIVACY_SCHEMA, PROFILE_SCHEMA, TENANT_CONCLUDE_SCHEMA]
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +348,8 @@ class HonchoMemoryProvider(MemoryProvider):
         self._tenant_store = None
         self._tenant_user_id = ""
         self._tenant_consented = False
+        self._tenant_deleted_this_turn = False
+        self._tenant_fact_saved_this_turn = False
 
     @property
     def name(self) -> str:
@@ -1328,6 +1347,67 @@ class HonchoMemoryProvider(MemoryProvider):
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         """Track turn count for cadence and injection_frequency logic."""
         self._turn_count = turn_number
+        self._tenant_deleted_this_turn = False
+        self._tenant_fact_saved_this_turn = False
+        if not (
+            self._config
+            and getattr(self._config, "tenant_policy_enabled", False) is True
+            and self._tenant_store
+            and self._tenant_user_id
+        ):
+            return
+        now_ms = int(time.time() * 1000)
+        from plugins.memory.honcho.client import delete_tenant_workspace
+
+        try:
+            deleted = self._tenant_store.delete_on_acknowledgement(
+                self._tenant_user_id,
+                message,
+                now_ms=now_ms,
+                delete_workspace=lambda candidate: delete_tenant_workspace(
+                    self._config,
+                    candidate,
+                ),
+            )
+            if deleted:
+                self._tenant_deleted_this_turn = True
+                self._tenant_consented = False
+                self._manager = None
+                self._session_initialized = False
+                return
+            self._tenant_consented = (
+                self._tenant_store.accept_acknowledgement(
+                    self._tenant_user_id,
+                    message,
+                    now_ms=now_ms,
+                )
+                or self._tenant_consented
+            )
+            if message.strip().casefold().startswith("/ingat "):
+                self._tenant_store.require_access(
+                    self._tenant_user_id,
+                    now_ms=now_ms,
+                )
+                from plugins.memory.honcho.tenant_policy import validate_fact
+
+                _, fact = validate_fact(
+                    "approved_cv_fact",
+                    message.strip()[len("/ingat ") :],
+                )
+                if not self._session_initialized and not self._ensure_session():
+                    raise RuntimeError("Honcho session could not be initialized")
+                if not self._manager.create_conclusion(
+                    self._session_key,
+                    f"[approved_cv_fact] {fact}",
+                    peer="user",
+                ):
+                    raise RuntimeError("Honcho fact write failed")
+                self._tenant_fact_saved_this_turn = True
+        except Exception as exc:
+            self._tenant_consented = False
+            self._manager = None
+            self._session_initialized = False
+            logger.error("Tenant memory lifecycle action failed: %s", exc)
 
     @staticmethod
     def _chunk_message(content: str, limit: int) -> list[str]:
@@ -1443,12 +1523,6 @@ class HonchoMemoryProvider(MemoryProvider):
             self._config
             and getattr(self._config, "tenant_policy_enabled", False) is True
         ):
-            if self._tenant_store and self._tenant_user_id:
-                self._tenant_consented = self._tenant_store.accept_acknowledgement(
-                    self._tenant_user_id,
-                    user_content or "",
-                    now_ms=int(time.time() * 1000),
-                ) or self._tenant_consented
             # Tenant mode stores approved conclusions only, never raw turns.
             return
         if self._recall_mode == "tools" and not self._session_ready():
@@ -1572,7 +1646,13 @@ class HonchoMemoryProvider(MemoryProvider):
                     self._tenant_consented = True
                 except Exception:
                     self._tenant_consented = False
-                return json.dumps({"consented": self._tenant_consented})
+                return json.dumps(
+                    {
+                        "consented": self._tenant_consented,
+                        "deleted_this_turn": self._tenant_deleted_this_turn,
+                        "fact_saved_this_turn": self._tenant_fact_saved_this_turn,
+                    }
+                )
             if action == "notice":
                 self._tenant_store.mark_notice(
                     self._tenant_user_id,
@@ -1585,26 +1665,19 @@ class HonchoMemoryProvider(MemoryProvider):
                     }
                 )
             if action == "forget":
-                from plugins.memory.honcho.client import delete_tenant_workspace
-
                 try:
-                    self._tenant_store.require_access(
+                    self._tenant_store.mark_deletion_notice(
                         self._tenant_user_id,
                         now_ms=int(time.time() * 1000),
                     )
-                    self._tenant_store.forget(
-                        self._tenant_user_id,
-                        delete_workspace=lambda candidate: delete_tenant_workspace(
-                            self._config,
-                            candidate,
-                        ),
-                    )
                 except Exception as exc:
-                    return tool_error(f"Memory deletion failed: {exc}")
-                self._tenant_consented = False
-                self._manager = None
-                self._session_initialized = False
-                return json.dumps({"deleted": True})
+                    return tool_error(f"Memory deletion request failed: {exc}")
+                return json.dumps(
+                    {
+                        "deletion_pending": True,
+                        "required_reply": "hapus ingatan saya",
+                    }
+                )
             return tool_error("action must be status, notice, or forget.")
 
         if (
@@ -1731,6 +1804,15 @@ class HonchoMemoryProvider(MemoryProvider):
                     and getattr(self._config, "tenant_policy_enabled", False) is True
                     else args.get("peer", "user")
                 )
+                tenant_mode = bool(
+                    self._config
+                    and getattr(self._config, "tenant_policy_enabled", False) is True
+                )
+                if tenant_mode and not list_mode:
+                    return tool_error(
+                        "Tenant facts may be added only by the verified user's "
+                        "direct '/ingat ' command; model writes and deletes are disabled."
+                    )
 
                 has_delete_id = bool(delete_id)
                 has_conclusion = bool(conclusion)

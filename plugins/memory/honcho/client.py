@@ -18,6 +18,7 @@ import os
 import logging
 import hashlib
 import ipaddress
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
@@ -1023,6 +1024,17 @@ def delete_tenant_workspace(
     for session in client.sessions(size=100):
         session.delete()
     client.delete_workspace(workspace_id)
+    for _ in range(60):
+        remaining = client.workspaces(
+            filters={"name": workspace_id},
+            size=1,
+        )
+        if workspace_id not in remaining.items:
+            return
+        time.sleep(0.5)
+    raise TimeoutError(
+        "Honcho workspace deletion was accepted but not verified complete"
+    )
 
 
 def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:

@@ -20,6 +20,7 @@ from plugins.memory.honcho.tenant_policy import (
 from plugins.memory.honcho.client import (
     HonchoClientConfig,
     build_tenant_honcho_client,
+    delete_tenant_workspace,
 )
 from plugins.memory.honcho.session import HonchoSession, HonchoSessionManager
 from plugins.memory.honcho import HonchoMemoryProvider
@@ -380,7 +381,7 @@ def test_privacy_notice_does_not_itself_grant_consent(tmp_path, monkeypatch):
     assert '"notice_pending": true' in result
     assert provider._tenant_consented is False
 
-    provider.sync_turn("boleh diingat", "Siap.")
+    provider.on_turn_start(2, "boleh diingat")
 
     assert provider._tenant_consented is True
     assert [tool["name"] for tool in provider.get_tool_schemas()] == [
@@ -388,6 +389,29 @@ def test_privacy_notice_does_not_itself_grant_consent(tmp_path, monkeypatch):
         "honcho_profile",
         "honcho_conclude",
     ]
+
+
+def test_notice_tool_cannot_accept_the_current_inbound_turn(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOKERKIT_MEMORY_TENANT_SECRET", SECRET.decode())
+    provider = HonchoMemoryProvider()
+    config = _tenant_config(tmp_path / "policy.sqlite3")
+    with patch(
+        "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
+        return_value=config,
+    ):
+        provider.initialize(
+            session_id="synthetic-session",
+            platform="whatsapp_cloud",
+            user_id="sender-a",
+        )
+
+    provider.on_turn_start(1, "boleh diingat")
+    provider.handle_tool_call("honcho_privacy", {"action": "notice"})
+    provider.sync_turn("boleh diingat", "Balas boleh diingat ya.")
+
+    assert provider._tenant_consented is False
+    with pytest.raises(ConsentRequired):
+        provider._tenant_store.require_access("sender-a", now_ms=200)
 
 
 def test_tenant_client_is_constructed_for_the_opaque_workspace(monkeypatch):
@@ -400,6 +424,28 @@ def test_tenant_client_is_constructed_for_the_opaque_workspace(monkeypatch):
     assert constructor.call_args.kwargs["workspace_id"] == "wa_opaque"
     assert constructor.call_args.kwargs["base_url"] == "http://127.0.0.1:8000"
     assert constructor.call_args.kwargs["api_key"] == "synthetic"
+
+
+def test_workspace_deletion_waits_until_honcho_confirms_absence():
+    config = _tenant_config(Path("/private/policy.sqlite3"))
+    client = MagicMock()
+    client.sessions.return_value = []
+    client.workspaces.side_effect = [
+        SimpleNamespace(items=["wa_opaque"]),
+        SimpleNamespace(items=[]),
+    ]
+
+    with (
+        patch(
+            "plugins.memory.honcho.client.build_tenant_honcho_client",
+            return_value=client,
+        ),
+        patch("plugins.memory.honcho.client.time.sleep"),
+    ):
+        delete_tenant_workspace(config, "wa_opaque")
+
+    client.delete_workspace.assert_called_once_with("wa_opaque")
+    assert client.workspaces.call_count == 2
 
 
 def test_consented_session_uses_opaque_workspace_and_no_sender_peer(
@@ -425,7 +471,7 @@ def test_consented_session_uses_opaque_workspace_and_no_sender_peer(
             user_id="sender-a",
         )
     provider.handle_tool_call("honcho_privacy", {"action": "notice"})
-    provider.sync_turn("boleh diingat", "Siap.")
+    provider.on_turn_start(2, "boleh diingat")
 
     with (
         patch(
@@ -484,7 +530,7 @@ def test_tenant_conclusion_requires_an_allowed_fact_category():
     manager.create_conclusion.assert_not_called()
 
 
-def test_tenant_conclusion_persists_one_validated_fact():
+def test_model_cannot_persist_a_tenant_fact():
     provider, manager = _ready_tenant_provider()
     manager.create_conclusion.return_value = True
 
@@ -496,12 +542,28 @@ def test_tenant_conclusion_persists_one_validated_fact():
         },
     )
 
-    assert '"error"' not in result
+    assert '"error"' in result
+    manager.create_conclusion.assert_not_called()
+
+
+def test_verified_user_direct_memory_command_persists_one_fact(tmp_path):
+    provider, manager = _ready_tenant_provider()
+    provider._tenant_store = TenantPolicyStore(
+        tmp_path / "policy.sqlite3",
+        secret=SECRET,
+        policy_version=POLICY_VERSION,
+    )
+    provider._tenant_store.grant_consent("sender-a", now_ms=100)
+    manager.create_conclusion.return_value = True
+
+    provider.on_turn_start(2, "/ingat lebih suka ringkasan singkat")
+
     manager.create_conclusion.assert_called_once_with(
         "cv-memory",
-        "[writing_preference] Prefers concise summaries.",
+        "[approved_cv_fact] lebih suka ringkasan singkat",
         peer="user",
     )
+    assert provider._tenant_fact_saved_this_turn is True
 
 
 def test_tenant_profile_tool_is_read_only():
@@ -568,7 +630,7 @@ def test_privacy_forget_deletes_whole_workspace_and_revokes_consent(
             user_id="sender-a",
         )
     provider.handle_tool_call("honcho_privacy", {"action": "notice"})
-    provider.sync_turn("boleh diingat", "Siap.")
+    provider.on_turn_start(2, "boleh diingat")
 
     with patch(
         "plugins.memory.honcho.client.delete_tenant_workspace"
@@ -577,10 +639,11 @@ def test_privacy_forget_deletes_whole_workspace_and_revokes_consent(
             "honcho_privacy",
             {"action": "forget"},
         )
+        provider.on_turn_start(3, "hapus ingatan saya")
 
     workspace = tenant_workspace_id("sender-a", SECRET)
     delete_workspace.assert_called_once_with(config, workspace)
-    assert '"deleted": true' in result
+    assert '"deletion_pending": true' in result
     assert provider._tenant_consented is False
     assert provider._manager is None
     assert provider._tenant_consented is False
@@ -606,7 +669,7 @@ def test_failed_workspace_deletion_does_not_revoke_consent(
             user_id="sender-a",
         )
     provider.handle_tool_call("honcho_privacy", {"action": "notice"})
-    provider.sync_turn("boleh diingat", "Siap.")
+    provider.on_turn_start(2, "boleh diingat")
 
     with patch(
         "plugins.memory.honcho.client.delete_tenant_workspace",
@@ -616,9 +679,10 @@ def test_failed_workspace_deletion_does_not_revoke_consent(
             "honcho_privacy",
             {"action": "forget"},
         )
+        provider.on_turn_start(3, "hapus ingatan saya")
 
-    assert '"error"' in result
-    assert provider._tenant_consented is True
+    assert '"deletion_pending": true' in result
+    assert provider._tenant_consented is False
 
 
 def test_retention_runner_deletes_stale_workspace(
