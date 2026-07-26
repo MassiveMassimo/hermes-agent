@@ -1029,7 +1029,13 @@ def delete_tenant_workspace(
             filters={"name": workspace_id},
             size=1,
         )
-        if workspace_id not in remaining.items:
+        remaining_ids = {
+            item
+            if isinstance(item, str)
+            else getattr(item, "name", getattr(item, "id", None))
+            for item in remaining.items
+        }
+        if workspace_id not in remaining_ids:
             return
         time.sleep(0.5)
     raise TimeoutError(

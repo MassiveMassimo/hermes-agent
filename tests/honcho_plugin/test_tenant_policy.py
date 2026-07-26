@@ -14,6 +14,7 @@ from plugins.memory.honcho.tenant_policy import (
     ALLOWED_FACT_CATEGORIES,
     ConsentRequired,
     TenantPolicyStore,
+    parse_user_fact_command,
     tenant_workspace_id,
     validate_fact,
 )
@@ -431,7 +432,7 @@ def test_workspace_deletion_waits_until_honcho_confirms_absence():
     client = MagicMock()
     client.sessions.return_value = []
     client.workspaces.side_effect = [
-        SimpleNamespace(items=["wa_opaque"]),
+        SimpleNamespace(items=[SimpleNamespace(name="wa_opaque")]),
         SimpleNamespace(items=[]),
     ]
 
@@ -446,6 +447,25 @@ def test_workspace_deletion_waits_until_honcho_confirms_absence():
 
     client.delete_workspace.assert_called_once_with("wa_opaque")
     assert client.workspaces.call_count == 2
+
+
+def test_workspace_deletion_fails_if_workspace_never_disappears():
+    config = _tenant_config(Path("/private/policy.sqlite3"))
+    client = MagicMock()
+    client.sessions.return_value = []
+    client.workspaces.return_value = SimpleNamespace(
+        items=[SimpleNamespace(name="wa_opaque")]
+    )
+
+    with (
+        patch(
+            "plugins.memory.honcho.client.build_tenant_honcho_client",
+            return_value=client,
+        ),
+        patch("plugins.memory.honcho.client.time.sleep"),
+        pytest.raises(TimeoutError, match="not verified"),
+    ):
+        delete_tenant_workspace(config, "wa_opaque")
 
 
 def test_consented_session_uses_opaque_workspace_and_no_sender_peer(
@@ -556,14 +576,32 @@ def test_verified_user_direct_memory_command_persists_one_fact(tmp_path):
     provider._tenant_store.grant_consent("sender-a", now_ms=100)
     manager.create_conclusion.return_value = True
 
-    provider.on_turn_start(2, "/ingat lebih suka ringkasan singkat")
+    provider.on_turn_start(2, "/ingat writing_style=concise")
 
     manager.create_conclusion.assert_called_once_with(
         "cv-memory",
-        "[approved_cv_fact] lebih suka ringkasan singkat",
+        "[approved_cv_fact] writing_style=concise",
         peer="user",
     )
     assert provider._tenant_fact_saved_this_turn is True
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "/ingat phone=08123456789",
+        "/ingat target_role=person@example.com",
+        "/ingat target_role=https://example.com/job",
+        "/ingat target_role=Senior Engineer 08123456789",
+        "/ingat sensitive_trait=religion",
+        "/ingat raw_cv=full resume excerpt",
+        "/ingat payment=4111111111111111",
+        "/ingat target_role=first line\nsecond line",
+    ],
+)
+def test_user_fact_command_rejects_prohibited_or_unstructured_content(message):
+    with pytest.raises(ValueError):
+        parse_user_fact_command(message)
 
 
 def test_tenant_profile_tool_is_read_only():

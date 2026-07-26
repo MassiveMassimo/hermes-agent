@@ -23,6 +23,16 @@ ALLOWED_FACT_CATEGORIES = frozenset(
 ACKNOWLEDGEMENT = "boleh diingat"
 DELETION_ACKNOWLEDGEMENT = "hapus ingatan saya"
 NOTICE_TTL_MS = 24 * 60 * 60 * 1000
+FACT_ENUMS = {
+    "cv_language": {"id", "en", "bilingual"},
+    "writing_style": {"concise", "formal", "casual"},
+    "page_preference": {"one", "two"},
+    "emphasis": {"achievements", "skills", "experience", "education"},
+}
+FACT_TEXT_FIELDS = {
+    "target_role": 80,
+    "target_industry": 60,
+}
 
 
 class ConsentRequired(PermissionError):
@@ -51,6 +61,44 @@ def validate_fact(category: str, content: str) -> tuple[str, str]:
     if "\n" in normalized_content or "\r" in normalized_content:
         raise ValueError("memory fact must be a single line")
     return normalized_category, normalized_content
+
+
+def parse_user_fact_command(message: str) -> tuple[str, str]:
+    """Parse a narrow verified-user command into a canonical safe fact."""
+    command = message.strip()
+    if not command.casefold().startswith("/ingat "):
+        raise ValueError("memory fact command must begin with /ingat")
+    payload = command[len("/ingat ") :].strip()
+    if "=" not in payload:
+        raise ValueError("memory fact command must use field=value")
+    field, value = (part.strip() for part in payload.split("=", 1))
+    field = field.casefold()
+    if field == "years_experience":
+        if not value.isascii() or not value.isdigit() or not 0 <= int(value) <= 60:
+            raise ValueError("years_experience must be an integer from 0 to 60")
+        return "approved_cv_fact", f"{field}={int(value)}"
+    if field in FACT_ENUMS:
+        normalized_value = value.casefold()
+        if normalized_value not in FACT_ENUMS[field]:
+            raise ValueError(f"{field} value is not allowed")
+        return "approved_cv_fact", f"{field}={normalized_value}"
+    if field in FACT_TEXT_FIELDS:
+        if not 1 <= len(value) <= FACT_TEXT_FIELDS[field]:
+            raise ValueError(f"{field} value is too long")
+        if any(char in value for char in "\r\n@:/\\"):
+            raise ValueError(f"{field} contains prohibited characters")
+        if sum(char.isdigit() for char in value) > 2:
+            raise ValueError(f"{field} contains too many digits")
+        if not all(
+            char.isalpha()
+            or char.isdigit()
+            or char.isspace()
+            or char in "&+-.()"
+            for char in value
+        ):
+            raise ValueError(f"{field} contains prohibited characters")
+        return "approved_cv_fact", f"{field}={value}"
+    raise ValueError("memory fact field is not allowed")
 
 
 class TenantPolicyStore:

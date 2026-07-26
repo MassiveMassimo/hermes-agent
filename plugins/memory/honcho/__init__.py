@@ -264,7 +264,9 @@ TENANT_CONCLUDE_SCHEMA = {
     "description": (
         "List the current user's explicitly approved CV-memory facts. "
         "Facts can be added only from a verified user command beginning with "
-        "'/ingat '; the model cannot create, alter, or delete them."
+        "'/ingat field=value'. Allowed fields are target_role, target_industry, "
+        "years_experience, cv_language, writing_style, page_preference, and "
+        "emphasis. The model cannot create, alter, or delete facts."
     ),
     "parameters": {
         "type": "object",
@@ -1388,12 +1390,11 @@ class HonchoMemoryProvider(MemoryProvider):
                     self._tenant_user_id,
                     now_ms=now_ms,
                 )
-                from plugins.memory.honcho.tenant_policy import validate_fact
-
-                _, fact = validate_fact(
-                    "approved_cv_fact",
-                    message.strip()[len("/ingat ") :],
+                from plugins.memory.honcho.tenant_policy import (
+                    parse_user_fact_command,
                 )
+
+                _, fact = parse_user_fact_command(message)
                 if not self._session_initialized and not self._ensure_session():
                     raise RuntimeError("Honcho session could not be initialized")
                 if not self._manager.create_conclusion(
