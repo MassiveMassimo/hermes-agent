@@ -432,6 +432,18 @@ def test_tenant_profile_tool_is_read_only():
     manager.set_peer_card.assert_not_called()
 
 
+def test_builtin_memory_writes_are_not_mirrored_in_tenant_mode():
+    provider, manager = _ready_tenant_provider()
+
+    provider.on_memory_write(
+        "add",
+        "user",
+        "Unvalidated built-in memory content",
+    )
+
+    manager.create_conclusion.assert_not_called()
+
+
 def test_privacy_forget_deletes_whole_workspace_and_revokes_consent(
     tmp_path,
     monkeypatch,

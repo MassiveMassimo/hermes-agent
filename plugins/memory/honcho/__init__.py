@@ -1478,6 +1478,11 @@ class HonchoMemoryProvider(MemoryProvider):
         """
         if action != "add" or target != "user" or not content:
             return
+        if (
+            self._config
+            and getattr(self._config, "tenant_policy_enabled", False) is True
+        ):
+            return
         if self._cron_skipped:
             return
         if self._recall_mode == "tools" and not self._session_ready():
