@@ -213,6 +213,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "external_memory": {
+        "description": "External memory-provider tools without Hermes built-in memory",
+        "tools": [],
+        "includes": []
+    },
+
     "context_engine": {
         "description": "Runtime tools exposed by the active context engine",
         "tools": [],

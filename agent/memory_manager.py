@@ -86,6 +86,8 @@ def memory_provider_tools_enabled(enabled_toolsets: Optional[List[str]]) -> bool
         return True
     if not enabled_toolsets:
         return False
+    if "external_memory" in enabled_toolsets:
+        return True
     if "memory" in enabled_toolsets:
         return True
 

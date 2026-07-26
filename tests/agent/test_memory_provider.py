@@ -1419,6 +1419,18 @@ class TestMemoryToolToolsetGate:
         tools, names = self._run_memory_injection(["terminal", "memory", "web"], mgr)
         assert "fact_store" in names
 
+    def test_external_memory_injects_provider_without_builtin_memory(self):
+        """The dedicated external-memory toolset opts in only provider tools."""
+        from toolsets import resolve_toolset
+
+        mgr = self._mgr_with_tools("honcho_privacy")
+        tools, names = self._run_memory_injection(["external_memory"], mgr)
+
+        assert resolve_toolset("external_memory") == []
+        assert "memory" not in resolve_toolset("external_memory")
+        assert "honcho_privacy" in names
+        assert any(t["function"]["name"] == "honcho_privacy" for t in tools)
+
     def test_composite_toolset_with_memory_injects(self):
         """Composite toolsets that include memory should inject provider tools."""
         mgr = self._mgr_with_tools("hindsight_recall")

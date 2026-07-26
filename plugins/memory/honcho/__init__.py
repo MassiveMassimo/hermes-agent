@@ -243,15 +243,16 @@ PRIVACY_SCHEMA = {
     "name": "honcho_privacy",
     "description": (
         "Manage the current WhatsApp user's private long-term CV memory. "
-        "Use status to check consent, accept only after the user clearly agrees "
-        "to the brief memory notice, and forget when the user asks to delete memory."
+        "Use status to check consent, notice to present the brief memory notice, "
+        "and forget when the user asks to delete memory. Consent is accepted only "
+        "from the user's subsequent exact acknowledgement."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["status", "accept", "forget"],
+                "enum": ["status", "notice", "forget"],
             }
         },
         "required": ["action"],
@@ -594,7 +595,11 @@ class HonchoMemoryProvider(MemoryProvider):
         # each one would flood the backend with short-lived duplicates instead
         # of performing a one-time migration.
         try:
-            if not session.messages and cfg.session_strategy != "per-session":
+            if (
+                cfg.tenant_policy_enabled is not True
+                and not session.messages
+                and cfg.session_strategy != "per-session"
+            ):
                 from hermes_constants import get_hermes_home
                 mem_dir = str(get_hermes_home() / "memories")
                 self._manager.migrate_memory_files(self._session_key, mem_dir)
@@ -1434,6 +1439,18 @@ class HonchoMemoryProvider(MemoryProvider):
         """
         if self._cron_skipped:
             return
+        if (
+            self._config
+            and getattr(self._config, "tenant_policy_enabled", False) is True
+        ):
+            if self._tenant_store and self._tenant_user_id:
+                self._tenant_consented = self._tenant_store.accept_acknowledgement(
+                    self._tenant_user_id,
+                    user_content or "",
+                    now_ms=int(time.time() * 1000),
+                ) or self._tenant_consented
+            # Tenant mode stores approved conclusions only, never raw turns.
+            return
         if self._recall_mode == "tools" and not self._session_ready():
             return
         if not self._session_ready():
@@ -1527,8 +1544,6 @@ class HonchoMemoryProvider(MemoryProvider):
             self._config
             and getattr(self._config, "tenant_policy_enabled", False) is True
         ):
-            if not self._tenant_consented:
-                return [PRIVACY_SCHEMA]
             return list(TENANT_TOOL_SCHEMAS)
         if self._recall_mode == "context":
             return []
@@ -1549,14 +1564,26 @@ class HonchoMemoryProvider(MemoryProvider):
                 return tool_error("Tenant privacy state is unavailable.")
             action = str(args.get("action") or "").strip()
             if action == "status":
+                try:
+                    self._tenant_store.require_access(
+                        self._tenant_user_id,
+                        now_ms=int(time.time() * 1000),
+                    )
+                    self._tenant_consented = True
+                except Exception:
+                    self._tenant_consented = False
                 return json.dumps({"consented": self._tenant_consented})
-            if action == "accept":
-                self._tenant_store.grant_consent(
+            if action == "notice":
+                self._tenant_store.mark_notice(
                     self._tenant_user_id,
                     now_ms=int(time.time() * 1000),
                 )
-                self._tenant_consented = True
-                return json.dumps({"consented": True})
+                return json.dumps(
+                    {
+                        "notice_pending": True,
+                        "required_reply": "boleh diingat",
+                    }
+                )
             if action == "forget":
                 from plugins.memory.honcho.client import delete_tenant_workspace
 
@@ -1578,14 +1605,25 @@ class HonchoMemoryProvider(MemoryProvider):
                 self._manager = None
                 self._session_initialized = False
                 return json.dumps({"deleted": True})
-            return tool_error("action must be status, accept, or forget.")
+            return tool_error("action must be status, notice, or forget.")
 
         if (
             self._config
             and getattr(self._config, "tenant_policy_enabled", False) is True
-            and not self._tenant_consented
         ):
-            return tool_error("Memory consent is required before using Honcho.")
+            if not self._tenant_store or not self._tenant_user_id:
+                return tool_error("Tenant privacy state is unavailable.")
+            try:
+                self._tenant_store.require_access(
+                    self._tenant_user_id,
+                    now_ms=int(time.time() * 1000),
+                )
+                self._tenant_consented = True
+            except Exception:
+                self._tenant_consented = False
+                self._manager = None
+                self._session_initialized = False
+                return tool_error("Memory consent is required before using Honcho.")
 
         if not self._session_initialized:
             if self._init_thread and self._init_thread.is_alive():
@@ -1598,7 +1636,12 @@ class HonchoMemoryProvider(MemoryProvider):
 
         try:
             if tool_name == "honcho_profile":
-                peer = args.get("peer", "user")
+                peer = (
+                    "user"
+                    if self._config
+                    and getattr(self._config, "tenant_policy_enabled", False) is True
+                    else args.get("peer", "user")
+                )
                 card_update = args.get("card")
                 if card_update:
                     if (
@@ -1628,6 +1671,11 @@ class HonchoMemoryProvider(MemoryProvider):
                     return tool_error("Missing required parameter: query")
                 max_tokens = min(int(args.get("max_tokens", 800)), 2000)
                 peer = args.get("peer", "user")
+                if (
+                    self._config
+                    and getattr(self._config, "tenant_policy_enabled", False) is True
+                ):
+                    peer = "user"
                 result = self._manager.search_context(
                     self._session_key, query, max_tokens=max_tokens, peer=peer
                 )
@@ -1677,7 +1725,12 @@ class HonchoMemoryProvider(MemoryProvider):
                 delete_id = (args.get("delete_id") or "").strip()
                 conclusion = args.get("conclusion", "").strip()
                 list_mode = bool(args.get("list"))
-                peer = args.get("peer", "user")
+                peer = (
+                    "user"
+                    if self._config
+                    and getattr(self._config, "tenant_policy_enabled", False) is True
+                    else args.get("peer", "user")
+                )
 
                 has_delete_id = bool(delete_id)
                 has_conclusion = bool(conclusion)

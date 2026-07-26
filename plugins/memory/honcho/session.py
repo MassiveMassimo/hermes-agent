@@ -1067,9 +1067,6 @@ class HonchoSessionManager:
         normalized = self._sanitize_id(candidate)
         if normalized == self._sanitize_id("user"):
             return session.user_peer_id
-        if normalized == self._sanitize_id("ai"):
-            return session.assistant_peer_id
-
         if (
             self._config
             and getattr(self._config, "tenant_policy_enabled", False) is True
@@ -1077,6 +1074,8 @@ class HonchoSessionManager:
             raise ValueError(
                 "tenant-isolated Honcho tools may target only the current user"
             )
+        if normalized == self._sanitize_id("ai"):
+            return session.assistant_peer_id
 
         return normalized
 
@@ -1263,7 +1262,11 @@ class HonchoSessionManager:
                 "content": content.strip(),
                 "session_id": session.honcho_session_id,
             }])
-            logger.info("Created conclusion about %s for %s: %s", target_peer_id, session_key, content[:80])
+            logger.info(
+                "Created conclusion about %s for %s",
+                target_peer_id,
+                session_key,
+            )
             return True
         except Exception as e:
             logger.error("Failed to create conclusion: %s", e)
