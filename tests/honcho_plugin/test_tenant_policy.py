@@ -593,6 +593,8 @@ def test_verified_user_direct_memory_command_persists_one_fact(tmp_path):
         "/ingat target_role=person@example.com",
         "/ingat target_role=https://example.com/job",
         "/ingat target_role=Senior Engineer 08123456789",
+        "/ingat target_role=Led team of 2 engineers",
+        "/ingat target_industry=Finance",
         "/ingat sensitive_trait=religion",
         "/ingat raw_cv=full resume excerpt",
         "/ingat payment=4111111111111111",

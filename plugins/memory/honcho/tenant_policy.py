@@ -29,10 +29,6 @@ FACT_ENUMS = {
     "page_preference": {"one", "two"},
     "emphasis": {"achievements", "skills", "experience", "education"},
 }
-FACT_TEXT_FIELDS = {
-    "target_role": 80,
-    "target_industry": 60,
-}
 
 
 class ConsentRequired(PermissionError):
@@ -82,22 +78,6 @@ def parse_user_fact_command(message: str) -> tuple[str, str]:
         if normalized_value not in FACT_ENUMS[field]:
             raise ValueError(f"{field} value is not allowed")
         return "approved_cv_fact", f"{field}={normalized_value}"
-    if field in FACT_TEXT_FIELDS:
-        if not 1 <= len(value) <= FACT_TEXT_FIELDS[field]:
-            raise ValueError(f"{field} value is too long")
-        if any(char in value for char in "\r\n@:/\\"):
-            raise ValueError(f"{field} contains prohibited characters")
-        if sum(char.isdigit() for char in value) > 2:
-            raise ValueError(f"{field} contains too many digits")
-        if not all(
-            char.isalpha()
-            or char.isdigit()
-            or char.isspace()
-            or char in "&+-.()"
-            for char in value
-        ):
-            raise ValueError(f"{field} contains prohibited characters")
-        return "approved_cv_fact", f"{field}={value}"
     raise ValueError("memory fact field is not allowed")
 
 

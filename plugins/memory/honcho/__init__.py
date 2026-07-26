@@ -264,9 +264,9 @@ TENANT_CONCLUDE_SCHEMA = {
     "description": (
         "List the current user's explicitly approved CV-memory facts. "
         "Facts can be added only from a verified user command beginning with "
-        "'/ingat field=value'. Allowed fields are target_role, target_industry, "
-        "years_experience, cv_language, writing_style, page_preference, and "
-        "emphasis. The model cannot create, alter, or delete facts."
+        "'/ingat field=value'. Allowed fields are years_experience, cv_language, "
+        "writing_style, page_preference, and emphasis. The model cannot create, "
+        "alter, or delete facts."
     ),
     "parameters": {
         "type": "object",
