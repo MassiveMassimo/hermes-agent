@@ -17,9 +17,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import threading
 import time
+from dataclasses import replace
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.memory_manager import sanitize_context
@@ -205,6 +208,16 @@ CONCLUDE_SCHEMA = {
                 "type": "string",
                 "description": "A factual statement to persist. Provide this when creating a conclusion. Do not send it together with delete_id or list.",
             },
+            "category": {
+                "type": "string",
+                "enum": [
+                    "approved_cv_fact",
+                    "role_preference",
+                    "writing_preference",
+                    "editing_decision",
+                ],
+                "description": "Required for writes in tenant-isolated mode.",
+            },
             "delete_id": {
                 "type": "string",
                 "description": "Conclusion ID to delete for PII removal. Provide this when deleting a conclusion. Do not send it together with conclusion or list. Get this id from a prior `list` call — never guess it.",
@@ -226,8 +239,28 @@ CONCLUDE_SCHEMA = {
     },
 }
 
+PRIVACY_SCHEMA = {
+    "name": "honcho_privacy",
+    "description": (
+        "Manage the current WhatsApp user's private long-term CV memory. "
+        "Use status to check consent, accept only after the user clearly agrees "
+        "to the brief memory notice, and forget when the user asks to delete memory."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["status", "accept", "forget"],
+            }
+        },
+        "required": ["action"],
+    },
+}
+
 
 ALL_TOOL_SCHEMAS = [PROFILE_SCHEMA, SEARCH_SCHEMA, REASONING_SCHEMA, CONTEXT_SCHEMA, CONCLUDE_SCHEMA]
+TENANT_TOOL_SCHEMAS = [PRIVACY_SCHEMA, PROFILE_SCHEMA, CONCLUDE_SCHEMA]
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +327,9 @@ class HonchoMemoryProvider(MemoryProvider):
 
         # Cron and flush contexts disable the plugin entirely.
         self._cron_skipped = False
+        self._tenant_store = None
+        self._tenant_user_id = ""
+        self._tenant_consented = False
 
     @property
     def name(self) -> str:
@@ -360,6 +396,47 @@ class HonchoMemoryProvider(MemoryProvider):
                 return
 
             self._config = cfg
+
+            if cfg.tenant_policy_enabled is True:
+                if cfg.recall_mode != "tools" or cfg.save_messages:
+                    raise ValueError(
+                        "tenant policy requires recallMode=tools and saveMessages=false"
+                    )
+                self._tenant_user_id = str(kwargs.get("user_id") or "").strip()
+                if not self._tenant_user_id:
+                    raise ValueError(
+                        "tenant policy requires a verified gateway user_id"
+                    )
+                secret_value = os.environ.get(cfg.tenant_secret_env, "")
+                if len(secret_value.encode("utf-8")) < 32:
+                    raise ValueError(
+                        f"{cfg.tenant_secret_env} must contain at least 32 bytes"
+                    )
+                if not cfg.tenant_policy_version:
+                    raise ValueError("tenantPolicyVersion is required")
+                database_path = (
+                    Path(cfg.tenant_policy_database)
+                    if cfg.tenant_policy_database
+                    else Path(os.environ["HERMES_HOME"]) / "state" / "honcho-tenants.sqlite3"
+                )
+                from plugins.memory.honcho.tenant_policy import (
+                    ConsentRequired,
+                    TenantPolicyStore,
+                )
+
+                self._tenant_store = TenantPolicyStore(
+                    database_path,
+                    secret=secret_value.encode("utf-8"),
+                    policy_version=cfg.tenant_policy_version,
+                )
+                try:
+                    self._tenant_store.require_access(
+                        self._tenant_user_id,
+                        now_ms=int(time.time() * 1000),
+                    )
+                    self._tenant_consented = True
+                except ConsentRequired:
+                    self._tenant_consented = False
 
             self._recall_mode = cfg.recall_mode  # "context", "tools", or "hybrid"
             logger.debug("Honcho recall_mode: %s", self._recall_mode)
@@ -466,19 +543,43 @@ class HonchoMemoryProvider(MemoryProvider):
 
     def _do_session_init(self, cfg, session_id: str, **kwargs) -> None:
         """Shared session initialization logic for both eager and lazy paths."""
-        from plugins.memory.honcho.client import get_honcho_client
+        from plugins.memory.honcho.client import (
+            build_tenant_honcho_client,
+            get_honcho_client,
+        )
         from plugins.memory.honcho.session import HonchoSessionManager
 
-        client = get_honcho_client(cfg)
+        runtime_user_peer_name = kwargs.get("user_id") or None
+        runtime_user_peer_name_alt = kwargs.get("user_id_alt") or None
+        if cfg.tenant_policy_enabled is True:
+            if not self._tenant_store or not self._tenant_user_id:
+                raise ValueError("tenant privacy state is unavailable")
+            workspace_id = self._tenant_store.require_access(
+                self._tenant_user_id,
+                now_ms=int(time.time() * 1000),
+            )
+            cfg = replace(
+                cfg,
+                workspace_id=workspace_id,
+                peer_name="user",
+                ai_peer="assistant",
+            )
+            client = build_tenant_honcho_client(cfg, workspace_id)
+            runtime_user_peer_name = None
+            runtime_user_peer_name_alt = None
+            self._session_key = "cv-memory"
+        else:
+            client = get_honcho_client(cfg)
         self._manager = HonchoSessionManager(
             honcho=client,
             config=cfg,
             context_tokens=cfg.context_tokens,
-            runtime_user_peer_name=kwargs.get("user_id") or None,
-            runtime_user_peer_name_alt=kwargs.get("user_id_alt") or None,
+            runtime_user_peer_name=runtime_user_peer_name,
+            runtime_user_peer_name_alt=runtime_user_peer_name_alt,
         )
 
-        self._session_key = self._resolve_session_key(cfg, session_id, **kwargs)
+        if cfg.tenant_policy_enabled is not True:
+            self._session_key = self._resolve_session_key(cfg, session_id, **kwargs)
         logger.debug("Honcho session key resolved: %s", self._session_key)
 
         # Create the remote session before running startup-only migration and
@@ -1417,6 +1518,13 @@ class HonchoMemoryProvider(MemoryProvider):
         """
         if self._cron_skipped:
             return []
+        if (
+            self._config
+            and getattr(self._config, "tenant_policy_enabled", False) is True
+        ):
+            if not self._tenant_consented:
+                return [PRIVACY_SCHEMA]
+            return list(TENANT_TOOL_SCHEMAS)
         if self._recall_mode == "context":
             return []
         return list(ALL_TOOL_SCHEMAS)
@@ -1425,6 +1533,54 @@ class HonchoMemoryProvider(MemoryProvider):
         """Handle a Honcho tool call, with lazy session init for tools-only mode."""
         if self._cron_skipped:
             return tool_error("Honcho is not active (cron context).")
+
+        if tool_name == "honcho_privacy":
+            if (
+                not self._config
+                or getattr(self._config, "tenant_policy_enabled", False) is not True
+            ):
+                return tool_error("Tenant privacy mode is not enabled.")
+            if not self._tenant_store or not self._tenant_user_id:
+                return tool_error("Tenant privacy state is unavailable.")
+            action = str(args.get("action") or "").strip()
+            if action == "status":
+                return json.dumps({"consented": self._tenant_consented})
+            if action == "accept":
+                self._tenant_store.grant_consent(
+                    self._tenant_user_id,
+                    now_ms=int(time.time() * 1000),
+                )
+                self._tenant_consented = True
+                return json.dumps({"consented": True})
+            if action == "forget":
+                from plugins.memory.honcho.client import delete_tenant_workspace
+
+                try:
+                    self._tenant_store.require_access(
+                        self._tenant_user_id,
+                        now_ms=int(time.time() * 1000),
+                    )
+                    self._tenant_store.forget(
+                        self._tenant_user_id,
+                        delete_workspace=lambda candidate: delete_tenant_workspace(
+                            self._config,
+                            candidate,
+                        ),
+                    )
+                except Exception as exc:
+                    return tool_error(f"Memory deletion failed: {exc}")
+                self._tenant_consented = False
+                self._manager = None
+                self._session_initialized = False
+                return json.dumps({"deleted": True})
+            return tool_error("action must be status, accept, or forget.")
+
+        if (
+            self._config
+            and getattr(self._config, "tenant_policy_enabled", False) is True
+            and not self._tenant_consented
+        ):
+            return tool_error("Memory consent is required before using Honcho.")
 
         if not self._session_initialized:
             if self._init_thread and self._init_thread.is_alive():
@@ -1440,6 +1596,18 @@ class HonchoMemoryProvider(MemoryProvider):
                 peer = args.get("peer", "user")
                 card_update = args.get("card")
                 if card_update:
+                    if (
+                        self._config
+                        and getattr(
+                            self._config,
+                            "tenant_policy_enabled",
+                            False,
+                        )
+                        is True
+                    ):
+                        return tool_error(
+                            "Peer card writes are disabled in tenant-isolated mode."
+                        )
                     result = self._manager.set_peer_card(self._session_key, card_update, peer=peer)
                     if result is None:
                         return tool_error("Failed to update peer card.")
@@ -1525,6 +1693,26 @@ class HonchoMemoryProvider(MemoryProvider):
                     if ok:
                         return json.dumps({"result": f"Conclusion {delete_id} deleted."})
                     return tool_error(f"Failed to delete conclusion {delete_id}.")
+                if (
+                    self._config
+                    and getattr(
+                        self._config,
+                        "tenant_policy_enabled",
+                        False,
+                    )
+                    is True
+                ):
+                    from plugins.memory.honcho.tenant_policy import validate_fact
+
+                    try:
+                        category, conclusion = validate_fact(
+                            str(args.get("category") or ""),
+                            conclusion,
+                        )
+                    except ValueError as exc:
+                        return tool_error(str(exc))
+                    conclusion = f"[{category}] {conclusion}"
+                    peer = "user"
                 ok = self._manager.create_conclusion(self._session_key, conclusion, peer=peer)
                 if ok:
                     return json.dumps({"result": f"Conclusion saved for {peer}: {conclusion}"})

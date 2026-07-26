@@ -384,6 +384,12 @@ class HonchoClientConfig:
     user_peer_aliases: dict[str, str] = field(default_factory=dict)
     # Optional prefix for unknown gateway runtime user IDs, e.g. "telegram_".
     runtime_peer_prefix: str = ""
+    # Optional multi-user policy boundary. When enabled, runtime identity is
+    # converted to an opaque workspace and consent is stored outside Honcho.
+    tenant_policy_enabled: bool = False
+    tenant_policy_version: str = ""
+    tenant_policy_database: str = ""
+    tenant_secret_env: str = "HONCHO_TENANT_SECRET"
     # Toggles
     enabled: bool = False
     save_messages: bool = True
@@ -617,6 +623,27 @@ class HonchoClientConfig:
                 host_block,
                 raw,
                 "runtimePeerPrefix",
+            ),
+            tenant_policy_enabled=_resolve_bool(
+                host_block.get("tenantPolicyEnabled"),
+                raw.get("tenantPolicyEnabled"),
+                default=False,
+            ),
+            tenant_policy_version=_parse_optional_string(
+                host_block,
+                raw,
+                "tenantPolicyVersion",
+            ),
+            tenant_policy_database=_parse_optional_string(
+                host_block,
+                raw,
+                "tenantPolicyDatabase",
+            ),
+            tenant_secret_env=_parse_optional_string(
+                host_block,
+                raw,
+                "tenantSecretEnv",
+                default="HONCHO_TENANT_SECRET",
             ),
             enabled=enabled,
             save_messages=save_messages,
@@ -961,6 +988,41 @@ def _refresh_cached_oauth(client: "Honcho", config: HonchoClientConfig | None) -
             _honcho_client_slot.reset()
     except Exception:
         logger.warning("Honcho OAuth cached refresh failed", exc_info=True)
+
+
+def build_tenant_honcho_client(
+    config: HonchoClientConfig,
+    workspace_id: str,
+) -> "Honcho":
+    """Build a non-shared client for one isolated gateway tenant workspace."""
+    if config.tenant_policy_enabled is not True:
+        raise ValueError("tenant policy is not enabled")
+    if not workspace_id:
+        raise ValueError("tenant workspace_id must not be empty")
+    from honcho import Honcho
+
+    kwargs: dict[str, Any] = {
+        "api_key": config.api_key,
+        "workspace_id": workspace_id,
+    }
+    if config.base_url:
+        kwargs["base_url"] = config.base_url
+    else:
+        kwargs["environment"] = config.environment
+    if config.timeout is not None:
+        kwargs["timeout"] = config.timeout
+    return Honcho(**kwargs)
+
+
+def delete_tenant_workspace(
+    config: HonchoClientConfig,
+    workspace_id: str,
+) -> None:
+    """Delete every session, then the complete isolated tenant workspace."""
+    client = build_tenant_honcho_client(config, workspace_id)
+    for session in client.sessions(size=100):
+        session.delete()
+    client.delete_workspace(workspace_id)
 
 
 def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:

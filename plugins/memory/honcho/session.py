@@ -159,6 +159,8 @@ class HonchoSessionManager:
         Routes every access through ``get_honcho_client`` (which returns the same
         cached singleton) so a long session can't outlive its 1h access token.
         """
+        if self._honcho is not None:
+            return self._honcho
         self._honcho = get_honcho_client()
         return self._honcho
 
@@ -1067,6 +1069,14 @@ class HonchoSessionManager:
             return session.user_peer_id
         if normalized == self._sanitize_id("ai"):
             return session.assistant_peer_id
+
+        if (
+            self._config
+            and getattr(self._config, "tenant_policy_enabled", False) is True
+        ):
+            raise ValueError(
+                "tenant-isolated Honcho tools may target only the current user"
+            )
 
         return normalized
 
