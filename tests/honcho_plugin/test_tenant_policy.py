@@ -447,6 +447,7 @@ def test_workspace_deletion_waits_until_honcho_confirms_absence():
 
     client.delete_workspace.assert_called_once_with("wa_opaque")
     assert client.workspaces.call_count == 2
+    client.workspaces.assert_called_with(size=100)
 
 
 def test_workspace_deletion_fails_if_workspace_never_disappears():

@@ -1025,10 +1025,7 @@ def delete_tenant_workspace(
         session.delete()
     client.delete_workspace(workspace_id)
     for _ in range(60):
-        remaining = client.workspaces(
-            filters={"name": workspace_id},
-            size=1,
-        )
+        remaining = client.workspaces(size=100)
         remaining_ids = {
             item
             if isinstance(item, str)
